@@ -1,6 +1,8 @@
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# SECUREAUTH LABS. Copyright (C) 2020 SecureAuth Corporation. All rights reserved.
+# Copyright Fortra, LLC and its affiliated companies 
+#
+# All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -298,7 +300,6 @@ class SMBConnection:
         :return: None
         :raise SessionError: if error
         """
-        import os
         from impacket.krb5.ccache import CCache
         from impacket.krb5.kerberosv5 import KerberosError
         from impacket.krb5 import constants
@@ -309,41 +310,8 @@ class SMBConnection:
         if TGT is not None or TGS is not None:
             useCache = False
 
-        if useCache is True:
-            try:
-                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
-            except:
-                # No cache present
-                pass
-            else:
-                LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
-                # retrieve domain information from CCache file if needed
-                if domain == '':
-                    domain = ccache.principal.realm['data'].decode('utf-8')
-                    LOG.debug('Domain retrieved from CCache: %s' % domain)
-
-                principal = 'cifs/%s@%s' % (self.getRemoteName().upper(), domain.upper())
-                creds = ccache.getCredential(principal)
-                if creds is None:
-                    # Let's try for the TGT and go from there
-                    principal = 'krbtgt/%s@%s' % (domain.upper(),domain.upper())
-                    creds =  ccache.getCredential(principal)
-                    if creds is not None:
-                        TGT = creds.toTGT()
-                        LOG.debug('Using TGT from cache')
-                    else:
-                        LOG.debug("No valid credentials found in cache. ")
-                else:
-                    TGS = creds.toTGS(principal)
-                    LOG.debug('Using TGS from cache')
-
-                # retrieve user information from CCache file if needed
-                if user == '' and creds is not None:
-                    user = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
-                    LOG.debug('Username retrieved from CCache: %s' % user)
-                elif user == '' and len(ccache.principal.components) > 0:
-                    user = ccache.principal.components[0]['data'].decode('utf-8')
-                    LOG.debug('Username retrieved from CCache: %s' % user)
+        if useCache:
+            domain, user, TGT, TGS = CCache.parseFile(domain, user, 'cifs/%s' % self.getRemoteName())
 
         while True:
             try:
@@ -415,7 +383,7 @@ class SMBConnection:
         dce = rpctransport.get_dce_rpc()
         dce.connect()
         dce.bind(srvs.MSRPC_UUID_SRVS)
-        resp = srvs.hNetrShareEnum(dce, 1)
+        resp = srvs.hNetrShareEnum(dce, 1, serverName="\\\\" + self.getRemoteHost())
         return resp['InfoStruct']['ShareInfo']['Level1']['Buffer']
 
     def listPath(self, shareName, path, password = None):
@@ -1023,7 +991,10 @@ class SessionError(Exception):
         return nt_errors.ERROR_MESSAGES[self.error]
 
     def __str__( self ):
-        if self.error in nt_errors.ERROR_MESSAGES:
-            return 'SMB SessionError: %s(%s)' % (nt_errors.ERROR_MESSAGES[self.error])
+        key = self.error
+        if key in nt_errors.ERROR_MESSAGES:
+            error_msg_short = nt_errors.ERROR_MESSAGES[key][0] 
+            error_msg_verbose = nt_errors.ERROR_MESSAGES[key][1] 
+            return 'SMB SessionError: code: 0x%x - %s - %s' % (self.error, error_msg_short, error_msg_verbose)
         else:
-            return 'SMB SessionError: 0x%x' % self.error
+            return 'SMB SessionError: unknown error code: 0x%x' % self.error
