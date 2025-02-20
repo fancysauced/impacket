@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# SECUREAUTH LABS. Copyright (C) 2021 SecureAuth Corporation. All rights reserved.
+# Copyright Fortra, LLC and its affiliated companies 
+#
+# All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -38,23 +40,8 @@ except Exception:
     logging.critical("Warning: You don't have any crypto installed. You need pycryptodomex")
     logging.critical("See https://pypi.org/project/pycryptodomex/")
 
-# If you wanna have readline like functionality in Windows, install pyreadline
-try:
-  import pyreadline as readline
-except ImportError:
-  import readline
 
-
-mimikatz_intro = r"""
-  .#####.   mimikatz RPC interface
- .## ^ ##.  "A La Vie, A L' Amour "
- ## / \ ##  /* * *
- ## \ / ##   Benjamin DELPY `gentilkiwi` ( benjamin@gentilkiwi.com )
- '## v ##'   http://blog.gentilkiwi.com/mimikatz             (oe.eo)
-  '#####'    Impacket client by Alberto Solino (@agsolino)    * * */
-
-
-Type help for list of commands"""
+mimikatz_intro = r"""Type help for list of commands"""
 
 
 class MimikatzShell(cmd.Cmd):

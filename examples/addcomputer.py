@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# SECUREAUTH LABS. Copyright (C) 2021 SecureAuth Corporation. All rights reserved.
+# Copyright Fortra, LLC and its affiliated companies 
+#
+# All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -40,7 +42,6 @@ import sys
 import string
 import random
 import ssl
-import os
 from binascii import unhexlify
 
 
@@ -149,7 +150,7 @@ class ADDCOMPUTER:
             connectTo = self.__targetIp
         try:
             user = '%s\\%s' % (self.__domain, self.__username)
-            tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2)
+            tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2, ciphers='ALL:@SECLEVEL=0')
             try:
                 ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
                 if self.__doKerberos:
@@ -165,7 +166,7 @@ class ADDCOMPUTER:
 
             except ldap3.core.exceptions.LDAPSocketOpenError:
                 #try tlsv1
-                tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1)
+                tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1, ciphers='ALL:@SECLEVEL=0')
                 ldapServer = ldap3.Server(connectTo, use_ssl=True, port=self.__port, get_info=ldap3.ALL, tls=tls)
                 if self.__doKerberos:
                     ldapConn = ldap3.Connection(ldapServer)
@@ -307,43 +308,9 @@ class ADDCOMPUTER:
         if TGT is not None or TGS is not None:
             useCache = False
 
+        targetName = 'ldap/%s' % self.__target
         if useCache:
-            try:
-                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
-            except Exception as e:
-                # No cache present
-                print(e)
-                pass
-            else:
-                # retrieve domain information from CCache file if needed
-                if domain == '':
-                    domain = ccache.principal.realm['data'].decode('utf-8')
-                    logging.debug('Domain retrieved from CCache: %s' % domain)
-
-                logging.debug('Using Kerberos Cache: %s' % os.getenv('KRB5CCNAME'))
-                principal = 'ldap/%s@%s' % (self.__target.upper(), domain.upper())
-
-                creds = ccache.getCredential(principal)
-                if creds is None:
-                    # Let's try for the TGT and go from there
-                    principal = 'krbtgt/%s@%s' % (domain.upper(), domain.upper())
-                    creds = ccache.getCredential(principal)
-                    if creds is not None:
-                        TGT = creds.toTGT()
-                        logging.debug('Using TGT from cache')
-                    else:
-                        logging.debug('No valid credentials found in cache')
-                else:
-                    TGS = creds.toTGS(principal)
-                    logging.debug('Using TGS from cache')
-
-                # retrieve user information from CCache file if needed
-                if user == '' and creds is not None:
-                    user = creds['client'].prettyPrint().split(b'@')[0].decode('utf-8')
-                    logging.debug('Username retrieved from CCache: %s' % user)
-                elif user == '' and len(ccache.principal.components) > 0:
-                    user = ccache.principal.components[0]['data'].decode('utf-8')
-                    logging.debug('Username retrieved from CCache: %s' % user)
+            domain, user, TGT, TGS = CCache.parseFile(domain, user, targetName)
 
         # First of all, we need to get a TGT for the user
         userName = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -357,7 +324,7 @@ class ADDCOMPUTER:
             sessionKey = TGT['sessionKey']
 
         if TGS is None:
-            serverName = Principal('ldap/%s' % self.__target, type=constants.PrincipalNameType.NT_SRV_INST.value)
+            serverName = Principal(targetName, type=constants.PrincipalNameType.NT_SRV_INST.value)
             tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdcHost, tgt, cipher,
                                                                     sessionKey)
         else:
@@ -390,7 +357,7 @@ class ADDCOMPUTER:
         authenticator['authenticator-vno'] = 5
         authenticator['crealm'] = domain
         seq_set(authenticator, 'cname', userName.components_to_asn1)
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         authenticator['cusec'] = now.microsecond
         authenticator['ctime'] = KerberosTime.to_asn1(now)
@@ -514,16 +481,7 @@ class ADDCOMPUTER:
                             else:
                                 raise
 
-                try:
-                    createUser = samr.hSamrCreateUser2InDomain(dce, domainHandle, self.__computerName, samr.USER_WORKSTATION_TRUST_ACCOUNT, samr.USER_FORCE_PASSWORD_CHANGE,)
-                except samr.DCERPCSessionError as e:
-                    if e.error_code == 0xc0000022:
-                        raise Exception("User %s doesn't have right to create a machine account!" % self.__username)
-                    elif e.error_code == 0xc00002e7:
-                        raise Exception("User %s machine quota exceeded!" % self.__username)
-                    else:
-                        raise
-
+                createUser = samr.hSamrCreateUser2InDomain(dce, domainHandle, self.__computerName, samr.USER_WORKSTATION_TRUST_ACCOUNT, samr.USER_FORCE_PASSWORD_CHANGE,)
                 userHandle = createUser['UserHandle']
 
             if self.__delete:

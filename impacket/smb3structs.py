@@ -1,6 +1,8 @@
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# SECUREAUTH LABS. Copyright (C) 2020 SecureAuth Corporation. All rights reserved.
+# Copyright Fortra, LLC and its affiliated companies 
+#
+# All rights reserved.
 #
 # This software is provided under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -618,6 +620,7 @@ class SMB2NegotiateContext(Structure):
         ('ContextType','<H=0'),
         ('DataLength','<H=0'),
         ('Reserved','<L=0'),
+        ('_Data', '_-Data', 'self["DataLength"]'),
         ('Data',':=""'),
     )
 
@@ -626,6 +629,7 @@ class SMB2PreAuthIntegrityCapabilities(Structure):
     structure = (
         ('HashAlgorithmCount','<H=0'),
         ('SaltLength','<H=0'),
+        ('_HashAlgorithms', '_-HashAlgorithms', 'self["HashAlgorithmCount"]*2'),
         ('HashAlgorithms',':=""'),
         ('Salt',':=""'),
     )
@@ -634,7 +638,7 @@ class SMB2PreAuthIntegrityCapabilities(Structure):
 class SMB2EncryptionCapabilities(Structure):
     structure = (
         ('CipherCount','<H=0'),
-        ('Ciphers','<H=0'),
+        ('Ciphers',':=""'),
     )
 
 # SMB2_COMPRESSION_CAPABILITIES
@@ -1490,6 +1494,12 @@ class FILE_ALL_INFORMATION(Structure):
         ('ModeInformation',':',FILE_MODE_INFORMATION),
         ('AlignmentInformation',':',FILE_ALIGNMENT_INFORMATION),
         ('NameInformation',':',FILE_NAME_INFORMATION),
+    )
+
+class FILE_ATTRIBUTE_TAG_INFORMATION(Structure):
+    structure = (
+        ('FileAttributes','<L'),
+        ('ReparseTag','<L=0'),
     )
 
 # SMB2_SET_INFO
